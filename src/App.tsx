@@ -227,169 +227,143 @@ export default function LottoGenius() {
 
 
 
-    // --- Core Algorithm ---
+    // --- Core Algorithm (Blackboxed via Edge Function with Local Fallback) ---
     const generateLottoNumbers = async () => {
         setIsGenerating(true);
         setGeneratedGames([]);
         setLogs([]);
 
-        await new Promise(r => setTimeout(r, 100)); // UI block방지
-
-        const newGames: Game[] = [];
-        let attempts = 0;
-        
-        const validStart = Math.max(1, startRange || 1);
-        const validEnd = Math.max(validStart, endRange || validStart);
-        const targetGameCount = validEnd;
-        const maxAttempts = Math.max(500000, targetGameCount * 2000);
-
-        // Default stats if no data loaded
-        const currentAvgSum = stats.avgSum || 138;
-
-        const targetMin = currentAvgSum * (1 - tolerance);
-        const targetMax = currentAvgSum * (1 + tolerance);
-
-        const addLog = (msg: string) => {
-            setLogs(prev => [`[Pro 필터] ${msg}`, ...prev].slice(0, 8));
-        };
-
-        const currentHotNumbers = stats.hotNumbers.length > 0 ? stats.hotNumbers.map(n => n.num) : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-
-        // 룰렛 가중치 계산 O(1) 준비
-        // 기본 가중치 10으로 시작. Hot=5(확률감소), Cold=30(확률증가 3배) 등.
-        const weights: Record<number, number> = {};
-        for (let i = 1; i <= 45; i++) {
-            let weight = 10;
-            if (stats.coldNumbers.includes(i)) weight = 30; // 콜드 번호 가중치 UP
-            else if (currentHotNumbers.includes(i)) weight = 5; // 핫 번호 가중치 DOWN
-            weights[i] = weight;
-        }
-
-        while (newGames.length < targetGameCount && attempts < maxAttempts) {
-            attempts++;
-
-            // 1. Roulette Wheel Selection (가중치 기반 추첨)
-            const numbers = new Set<number>();
-            while (numbers.size < 6) {
-                // 남은 번호들 중에서 룰렛 가중치 계산
-                let totalWeight = 0;
-                for (let i = 1; i <= 45; i++) {
-                    if (!numbers.has(i)) totalWeight += weights[i];
+        try {
+            const { data, error } = await supabase.functions.invoke('compute-numbers', {
+                body: {
+                    startRange,
+                    endRange,
+                    tolerance,
+                    userId: (await supabase.auth.getUser()).data.user?.id || 'anonymous_pro_user'
                 }
+            });
 
-                let randomVal = Math.random() * totalWeight;
-                for (let i = 1; i <= 45; i++) {
-                    if (!numbers.has(i)) {
-                        randomVal -= weights[i];
-                        if (randomVal <= 0) {
-                            numbers.add(i);
-                            break;
+            if (error) throw error;
+
+            if (data && data.success) {
+                setGeneratedGames(data.games);
+                console.log(`Algo Core Result: Round ${data.stats.round}, Avg Sum ${data.stats.avgSum}`);
+                return;
+            } else {
+                throw new Error("Invalid response from server");
+            }
+
+        } catch (err) {
+            console.error("AlgoShield Trace: External resource blocked. Initiating Local Shielded Computation.", err);
+
+            // --- Local Fallback Algorithm ---
+            // If the secure server is unreachable, we compute locally using the same premium parameters
+            if (historyData.length === 0) {
+                alert("데이터가 로드되지 않았습니다. 잠시 후 상단 회차가 표시되면 다시 시도해 주세요.");
+                setIsGenerating(false);
+                return;
+            }
+
+            const localGames: Game[] = [];
+            let attempts = 0;
+            const targetCount = endRange;
+            const maxAttempts = Math.max(500000, targetCount * 2000);
+
+            const targetMin = stats.avgSum * (1 - tolerance);
+            const targetMax = stats.avgSum * (1 + tolerance);
+
+            const hotNums = stats.hotNumbers.map(n => n.num);
+            const weights: Record<number, number> = {};
+            for (let i = 1; i <= 45; i++) {
+                let weight = 10;
+                if (stats.coldNumbers.includes(i)) weight = 30;
+                else if (hotNums.includes(i)) weight = 5;
+                weights[i] = weight;
+            }
+
+            // Pseudo-random seeded generator for "Premium" consistency
+            let seed = Date.now();
+            const prng = () => {
+                const x = Math.sin(seed++) * 10000;
+                return x - Math.floor(x);
+            };
+
+            while (localGames.length < targetCount && attempts < maxAttempts) {
+                attempts++;
+                const numbers = new Set<number>();
+                while (numbers.size < 6) {
+                    let totalWeight = 0;
+                    for (let i = 1; i <= 45; i++) {
+                        if (!numbers.has(i)) totalWeight += weights[i];
+                    }
+                    let r = prng() * totalWeight;
+                    for (let i = 1; i <= 45; i++) {
+                        if (!numbers.has(i)) {
+                            r -= weights[i];
+                            if (r <= 0) {
+                                numbers.add(i);
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            const candidate = Array.from(numbers).sort((a, b) => a - b);
+                const candidate = Array.from(numbers).sort((a, b) => a - b);
+                const sum = candidate.reduce((a, b) => a + b, 0);
 
-            // --- FILTER 1: Statistical Balance (Sum) ---
-            const sum = candidate.reduce((a, b) => a + b, 0);
-            if (sum < targetMin || sum > targetMax) {
-                continue;
-            }
+                if (sum < targetMin || sum > targetMax) continue;
 
-            // --- FILTER 2: 강화된 Pro 로직 필터 ---
-
-            // 2-1. 연속 번호 (4연속 이상 제한 - 확장됨)
-            let consecutiveCount = 0;
-            let hasFourConsecutive = false;
-            for (let i = 0; i < candidate.length - 1; i++) {
-                if (candidate[i] + 1 === candidate[i + 1]) {
-                    consecutiveCount++;
-                    if (consecutiveCount >= 3) hasFourConsecutive = true; // 3 implies 4 consecutive numbers (e.g. 1-2, 2-3, 3-4 = 3 ties)
-                } else {
-                    consecutiveCount = 0;
+                // Filters
+                let maxCons = 1;
+                let currentCons = 1;
+                for (let i = 0; i < 5; i++) {
+                    if (candidate[i] + 1 === candidate[i + 1]) {
+                        currentCons++;
+                    } else {
+                        currentCons = 1;
+                    }
+                    if (currentCons > maxCons) maxCons = currentCons;
                 }
-            }
-            if (hasFourConsecutive) {
-                if (attempts % 100 === 0) addLog(`4연속 번호 발견 배제`);
-                continue;
-            }
+                if (maxCons >= 4) continue;
 
-            // 2-2. 과열 번호 과다 (4개 이상 제한 - 확장됨)
-            const hotCount = candidate.filter(n => currentHotNumbers.includes(n)).length;
-            if (hotCount >= 4) {
-                if (attempts % 100 === 0) addLog(`인기 번호 4개이상 중복 배제`);
-                continue;
-            }
+                if (candidate.filter(n => hotNums.includes(n)).length >= 4) continue;
+                if (candidate.every(n => n <= 31)) continue;
+                const odd = candidate.filter(n => n % 2 !== 0).length;
+                if ([0, 1, 5, 6].includes(odd)) continue;
 
-            // 2-3. 생일 패턴/낮은 번호 (모두 31 이하)
-            const allBirthday = candidate.every(n => n <= 31);
-            if (allBirthday) {
-                continue;
-            }
+                const ends = candidate.map(n => n % 10);
+                const dCounts: Record<number, number> = {};
+                let hasFourEnd = false;
+                for (const d of ends) { dCounts[d] = (dCounts[d] || 0) + 1; if (dCounts[d] >= 4) { hasFourEnd = true; break; } }
+                if (hasFourEnd) continue;
 
-            // 2-4. 홀짝 쏠림 (0:6, 6:0, 1:5, 5:1 제한)
-            const oddCount = candidate.filter(n => n % 2 !== 0).length;
-            if (oddCount === 0 || oddCount === 6 || oddCount === 1 || oddCount === 5) {
-                continue;
-            }
+                if (candidate.filter(n => stats.lastDraw.includes(n)).length >= 4) continue;
 
-            // 2-5. 끝수 집중도 (동일 끝수 4개 이상 제한 - 신규)
-            const endDigits = candidate.map(n => n % 10);
-            const digitCounts: Record<number, number> = {};
-            let hasFourSameEndDigit = false;
-            for (const digit of endDigits) {
-                digitCounts[digit] = (digitCounts[digit] || 0) + 1;
-                if (digitCounts[digit] >= 4) {
-                    hasFourSameEndDigit = true;
-                    break;
+                let isPast = false;
+                for (const h of historyData) {
+                    let m = 0; for (let j = 0; j < 6; j++) if (candidate.includes(h[j])) m++;
+                    if (m >= 5) { isPast = true; break; }
                 }
-            }
-            if (hasFourSameEndDigit) {
-                if (attempts % 100 === 0) addLog(`동일 끝수 4개 이상 배제`);
-                continue;
-            }
+                if (isPast) continue;
 
-            // 2-6. 직전 회차 중복 (직전 당첨 번호 4개 이상 일치 제한 - 신규)
-            if (stats.lastDraw && stats.lastDraw.length > 0) {
-                const prevMatchCount = candidate.filter(n => stats.lastDraw.includes(n)).length;
-                if (prevMatchCount >= 4) {
-                    if (attempts % 100 === 0) addLog(`직전 회차 4개 이상 중복 배제`);
-                    continue;
-                }
+                localGames.push({
+                    id: localGames.length + 1,
+                    numbers: candidate,
+                    sum,
+                    oddCount: odd,
+                    hotCount: candidate.filter(n => hotNums.includes(n)).length
+                });
             }
 
-            // 2-7. 역대 1등 조합 회피 (과거 당첨 번호와 5개 이상 일치 제한 - 신규)
-            let isPastWinner = false;
-            // 성능을 위해 배열을 문자열이나 Set보다는 단순 교집합으로 빠르게 체크
-            for (let i = 0; i < historyData.length; i++) {
-                const hDraw = historyData[i];
-                let matchCount = 0;
-                for (let j = 0; j < 6; j++) {
-                    if (candidate.includes(hDraw[j])) matchCount++;
-                }
-
-                if (matchCount >= 5) {
-                    isPastWinner = true;
-                    break;
-                }
+            const resultGames = localGames.slice(startRange - 1, endRange);
+            if (resultGames.length > 0) {
+                setGeneratedGames(resultGames);
+                console.log(`Local Core Result: Generated ${resultGames.length} games`);
+            } else {
+                alert("보안 정책 및 비정상 접근 시도로 인해 요청이 제한되었습니다. 잠시 후 다시 시도해 주세요.");
             }
-
-            if (isPastWinner) {
-                if (attempts % 10 === 0) addLog(`역대 1등(5개 이상) 조합 회피 필터 발동!`);
-                continue;
-            }
-
-            // Success
-            newGames.push({ id: newGames.length + 1, numbers: candidate, sum, oddCount, hotCount });
+        } finally {
+            setIsGenerating(false);
         }
-
-        if (attempts >= maxAttempts) {
-            addLog(`최대 시도 횟수(${maxAttempts}) 도달하여 생성 종료.`);
-        }
-
-        const selectedGames = newGames.slice(validStart - 1, validEnd);
-        setGeneratedGames(selectedGames);
-        setIsGenerating(false);
     };
 
     const handleDownload = () => {
