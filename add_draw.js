@@ -47,7 +47,7 @@ try {
     // 3. Run migration
     console.log("🔄 Supabase 동기화 시작...");
     // Use --env-file=.env to load environment variables for the migration script
-    execSync('node --env-file=.env migrate_to_supabase.js', { stdio: 'inherit' });
+    execSync('node --env-file=.env.local migrate_to_supabase.js', { stdio: 'inherit' });
 
     // 4. GitHub Push
     console.log("🚀 GitHub 저장소에 변경사항 푸시 중...");
