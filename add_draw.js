@@ -51,7 +51,7 @@ try {
 
     // 4. GitHub Push
     console.log("🚀 GitHub 저장소에 변경사항 푸시 중...");
-    execSync('git add public/lotto_results.csv dist/lotto_results.csv add_draw.js package.json', { stdio: 'inherit' });
+    execSync('git add public/lotto_results.csv add_draw.js package.json', { stdio: 'inherit' });
     execSync(`git commit -m "Update lotto results for draw ${drawNo}"`, { stdio: 'inherit' });
     execSync('git push', { stdio: 'inherit' });
 
