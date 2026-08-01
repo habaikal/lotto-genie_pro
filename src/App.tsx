@@ -1,10 +1,13 @@
 import { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
-import { RefreshCw, BarChart2, Zap, TrendingUp, Settings, Download, Share, Trash2 } from 'lucide-react';
-import * as XLSX from 'xlsx';
+import { RefreshCw, BarChart2, Zap, TrendingUp, Settings, Download, Share, Trash2, Crown, Lock } from 'lucide-react';
+import { computeLottoStats, generateLottoGames, type LottoDraw, type Game, type LottoStats } from '../supabase/functions/_shared/lottoAlgorithm';
+// xlsx는 다운로드/공유 버튼을 누를 때만 필요하므로 초기 번들에서 제외하고 동적 import로 불러온다
 
 /**
  * LOTTO GENIUS - 통계적 균형 및 비인기 조합 필터 기반 로또 번호 생성기
+ * 번호 생성 알고리즘 본체는 supabase/functions/_shared/lottoAlgorithm.ts에 있으며
+ * 이 컴포넌트와 compute-numbers Edge Function이 그 모듈을 함께 사용한다.
  */
 
 // --- Constants & Utilities ---
@@ -46,19 +49,8 @@ const getBallStyle = (num: number) => {
 };
 
 // Types
-type LottoDraw = number[];
-type Stats = {
-    avgSum: number;
-    hotNumbers: { num: number, count: number }[]; // Store count for weighting
-    coldNumbers: number[]; // Track numbers that haven't appeared recently
-    lastDraw: number[]; // Store recent draw for checking against previous drawing
-};
-type Game = {
-    id: number;
-    numbers: number[];
-    sum: number;
-    oddCount: number;
-    hotCount: number;
+type Stats = LottoStats & {
+    sumRangeRatio: Record<number, number>; // 합계 ±범위별 실제 회차 비율(%)
 };
 
 // --- Components ---
@@ -115,13 +107,51 @@ export default function LottoGenius() {
     const [historyData, setHistoryData] = useState<LottoDraw[]>([]);
 
 
-    const [tolerance] = useState(0.05); // 5% default
     const [generatedGames, setGeneratedGames] = useState<Game[]>([]);
     const [isGenerating, setIsGenerating] = useState(false);
-    const [stats, setStats] = useState<Stats>({ avgSum: 0, hotNumbers: [], coldNumbers: [], lastDraw: [] });
+    const [stats, setStats] = useState<Stats>({ avgSum: 0, hotNumbers: [], coldNumbers: [], sumRangeRatio: {} });
     const [, setLogs] = useState<string[]>([]);
-    const [startRange, setStartRange] = useState<number>(1);
-    const [endRange, setEndRange] = useState<number>(50);
+
+    // 회원 등급 (데모용 토글 - 실제 로그인/결제 연동 없음)
+    const [isPremium, setIsPremium] = useState<boolean>(false);
+    const FREE_SUM_RANGE = 40;
+    const FREE_START = 1;
+    const FREE_END = 5;
+    const SUM_RANGE_OPTIONS = [10, 20, 30, 40];
+    const SUM_RANGE_LEVEL_LABEL: Record<number, string> = { 10: '레벨 1', 20: '레벨 2', 30: '레벨 3', 40: '레벨 4' };
+
+    // 필터 체인(4-2 연속수, 4-4 생일조합, 4-5 홀짝, 4-6 끝자리, 4-8 과거일치)을 전부 만족하는
+    // 조합은 유한하다. C(45,6)=8,145,060개를 완전열거해서 합계범위별 실제 최대 개수를 구한 값
+    // (scripts/analyze-filters.mjs 결과) - 회차 데이터가 크게 갱신되면 재계산해서 갱신할 것.
+    const MAX_GAMES_BY_RANGE: Record<number, number> = {
+        10: 1132575,
+        20: 2108511,
+        30: 2841629,
+        40: 3330345,
+    };
+
+    // 합계 평균 기준 +/- 허용 범위
+    const [sumRange, setSumRange] = useState<number>(FREE_SUM_RANGE);
+    // 원하는 게임 구간
+    const [startRange, setStartRange] = useState<number>(FREE_START);
+    const [endRange, setEndRange] = useState<number>(FREE_END);
+
+    const maxGamesForRange = MAX_GAMES_BY_RANGE[sumRange] ?? MAX_GAMES_BY_RANGE[FREE_SUM_RANGE];
+
+    // 무료 회원은 무조건 합계범위 ±5, 게임 구간 1~5로 고정
+    useEffect(() => {
+        if (!isPremium) {
+            if (sumRange !== FREE_SUM_RANGE) setSumRange(FREE_SUM_RANGE);
+            if (startRange !== FREE_START) setStartRange(FREE_START);
+            if (endRange !== FREE_END) setEndRange(FREE_END);
+        }
+    }, [isPremium, sumRange, startRange, endRange]);
+
+    // 합계범위를 바꿔서 알고리즘상 최대 생성 가능 개수가 줄어들면 구간도 함께 보정
+    useEffect(() => {
+        if (endRange > maxGamesForRange) setEndRange(maxGamesForRange);
+        if (startRange > maxGamesForRange) setStartRange(maxGamesForRange);
+    }, [maxGamesForRange, endRange, startRange]);
 
 
     // Auto-load data from Supabase on mount
@@ -181,46 +211,23 @@ export default function LottoGenius() {
         fetchLottoData();
     }, []);
 
-    // --- Statistics Calculation ---
+    // --- Statistics Calculation (공유 알고리즘 모듈 사용) ---
     useEffect(() => {
         if (!historyData || historyData.length === 0) return;
 
-        // 1. Calculate Average Sum
-        let totalSum = 0;
-        const frequency: Record<number, number> = {};
+        const { avgSum, hotNumbers, coldNumbers } = computeLottoStats(historyData);
 
-        // Track recency for cold numbers
-        const lastAppearance: Record<number, number> = {};
-
-        historyData.forEach((draw, index) => {
-            const sum = draw.reduce((a, b) => a + b, 0);
-            totalSum += sum;
-            draw.forEach(num => {
-                frequency[num] = (frequency[num] || 0) + 1;
-                lastAppearance[num] = index; // The higher the index, the more recent
-            });
+        // 합계 ±범위별 실제 회차 비율(%) - 몬테카를로 근사가 아닌 전체 회차 전수 계산 (UI 표시 전용)
+        const drawSums = historyData.map(draw => draw.reduce((a, b) => a + b, 0));
+        const sumRangeRatio: Record<number, number> = {};
+        SUM_RANGE_OPTIONS.forEach(r => {
+            const min = avgSum - r;
+            const max = avgSum + r;
+            const count = drawSums.filter(s => s >= min && s <= max).length;
+            sumRangeRatio[r] = (count / drawSums.length) * 100;
         });
 
-        const avgSum = totalSum / historyData.length;
-
-        // 2. Identify Hot and Cold Numbers
-        const sortedNums = Object.keys(frequency)
-            .map(num => ({ num: parseInt(num), count: frequency[parseInt(num)] }))
-            .sort((a, b) => b.count - a.count);
-
-        // 15주(15회차) 이상 미출현 번호 찾기
-        const recentHistoryLimit = historyData.length - 15;
-        const coldNumbers = [];
-        for (let i = 1; i <= 45; i++) {
-            if ((lastAppearance[i] ?? -1) < recentHistoryLimit) {
-                coldNumbers.push(i);
-            }
-        }
-
-        // Store recent draw
-        const lastDraw = historyData[historyData.length - 1] || [];
-
-        setStats({ avgSum, hotNumbers: sortedNums.slice(0, 10), coldNumbers, lastDraw });
+        setStats({ avgSum, hotNumbers, coldNumbers, sumRangeRatio });
     }, [historyData]);
 
 
@@ -229,6 +236,19 @@ export default function LottoGenius() {
 
     // --- Core Algorithm (Blackboxed via Edge Function with Local Fallback) ---
     const generateLottoNumbers = async () => {
+        if (!isPremium && (sumRange !== FREE_SUM_RANGE || startRange !== FREE_START || endRange !== FREE_END)) {
+            alert(`무료 회원은 합계 평균 ±${FREE_SUM_RANGE} 범위에서 ${FREE_START}~${FREE_END}번 게임만 선택할 수 있습니다. 다른 범위와 구간은 유료 회원 전환 후 이용해 주세요.`);
+            return;
+        }
+        if (startRange < 1 || endRange < startRange) {
+            alert("게임 구간을 올바르게 입력해 주세요. (시작 ≤ 종료, 1 이상)");
+            return;
+        }
+        if (endRange > maxGamesForRange) {
+            alert(`선택하신 합계범위(레벨)에서 알고리즘이 만들 수 있는 조합은 최대 ${maxGamesForRange.toLocaleString()}개입니다. 구간을 다시 입력해 주세요.`);
+            return;
+        }
+
         setIsGenerating(true);
         setGeneratedGames([]);
         setLogs([]);
@@ -238,7 +258,7 @@ export default function LottoGenius() {
                 body: {
                     startRange,
                     endRange,
-                    tolerance,
+                    sumRange,
                     userId: (await supabase.auth.getUser()).data.user?.id || 'anonymous_pro_user'
                 }
             });
@@ -264,23 +284,6 @@ export default function LottoGenius() {
                 return;
             }
 
-            const localGames: Game[] = [];
-            let attempts = 0;
-            const targetCount = endRange;
-            const maxAttempts = Math.max(500000, targetCount * 2000);
-
-            const targetMin = stats.avgSum * (1 - tolerance);
-            const targetMax = stats.avgSum * (1 + tolerance);
-
-            const hotNums = stats.hotNumbers.map(n => n.num);
-            const weights: Record<number, number> = {};
-            for (let i = 1; i <= 45; i++) {
-                let weight = 10;
-                if (stats.coldNumbers.includes(i)) weight = 30;
-                else if (hotNums.includes(i)) weight = 5;
-                weights[i] = weight;
-            }
-
             // Pseudo-random seeded generator for "Premium" consistency
             let seed = Date.now();
             const prng = () => {
@@ -288,73 +291,17 @@ export default function LottoGenius() {
                 return x - Math.floor(x);
             };
 
-            while (localGames.length < targetCount && attempts < maxAttempts) {
-                attempts++;
-                const numbers = new Set<number>();
-                while (numbers.size < 6) {
-                    let totalWeight = 0;
-                    for (let i = 1; i <= 45; i++) {
-                        if (!numbers.has(i)) totalWeight += weights[i];
-                    }
-                    let r = prng() * totalWeight;
-                    for (let i = 1; i <= 45; i++) {
-                        if (!numbers.has(i)) {
-                            r -= weights[i];
-                            if (r <= 0) {
-                                numbers.add(i);
-                                break;
-                            }
-                        }
-                    }
-                }
-                const candidate = Array.from(numbers).sort((a, b) => a - b);
-                const sum = candidate.reduce((a, b) => a + b, 0);
+            const resultGames = generateLottoGames({
+                historyData,
+                avgSum: stats.avgSum,
+                hotNums: stats.hotNumbers.map(n => n.num),
+                coldNumbers: stats.coldNumbers,
+                sumRange,
+                startRange,
+                endRange,
+                prng,
+            });
 
-                if (sum < targetMin || sum > targetMax) continue;
-
-                // Filters
-                let maxCons = 1;
-                let currentCons = 1;
-                for (let i = 0; i < 5; i++) {
-                    if (candidate[i] + 1 === candidate[i + 1]) {
-                        currentCons++;
-                    } else {
-                        currentCons = 1;
-                    }
-                    if (currentCons > maxCons) maxCons = currentCons;
-                }
-                if (maxCons >= 4) continue;
-
-                if (candidate.filter(n => hotNums.includes(n)).length >= 4) continue;
-                if (candidate.every(n => n <= 31)) continue;
-                const odd = candidate.filter(n => n % 2 !== 0).length;
-                if ([0, 1, 5, 6].includes(odd)) continue;
-
-                const ends = candidate.map(n => n % 10);
-                const dCounts: Record<number, number> = {};
-                let hasFourEnd = false;
-                for (const d of ends) { dCounts[d] = (dCounts[d] || 0) + 1; if (dCounts[d] >= 4) { hasFourEnd = true; break; } }
-                if (hasFourEnd) continue;
-
-                if (candidate.filter(n => stats.lastDraw.includes(n)).length >= 4) continue;
-
-                let isPast = false;
-                for (const h of historyData) {
-                    let m = 0; for (let j = 0; j < 6; j++) if (candidate.includes(h[j])) m++;
-                    if (m >= 5) { isPast = true; break; }
-                }
-                if (isPast) continue;
-
-                localGames.push({
-                    id: localGames.length + 1,
-                    numbers: candidate,
-                    sum,
-                    oddCount: odd,
-                    hotCount: candidate.filter(n => hotNums.includes(n)).length
-                });
-            }
-
-            const resultGames = localGames.slice(startRange - 1, endRange);
             if (resultGames.length > 0) {
                 setGeneratedGames(resultGames);
                 console.log(`Local Core Result: Generated ${resultGames.length} games`);
@@ -366,8 +313,10 @@ export default function LottoGenius() {
         }
     };
 
-    const handleDownload = () => {
+    const handleDownload = async () => {
         if (generatedGames.length === 0) return;
+
+        const XLSX = await import('xlsx');
 
         const data = generatedGames.map((game) => ({
             '선택': `게임 ${game.id}`,
@@ -390,6 +339,8 @@ export default function LottoGenius() {
 
     const handleSend = async () => {
         if (generatedGames.length === 0) return;
+
+        const XLSX = await import('xlsx');
 
         const data = generatedGames.map((game) => ({
             '선택': `게임 ${game.id}`,
@@ -471,7 +422,7 @@ export default function LottoGenius() {
                             <h1 className="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-amber-200 via-yellow-500 to-amber-700 tracking-tighter">
                                 LOTTO GENIE PRO
                             </h1>
-                            <p className="text-xs text-amber-500/60 uppercase tracking-widest mt-1 font-medium">Premium AI Prediction Engine</p>
+                            <p className="text-xs text-amber-500/60 uppercase tracking-widest mt-1 font-medium">Statistical Pattern Filter Engine</p>
                         </div>
                     </div>
                 </div>
@@ -505,11 +456,55 @@ export default function LottoGenius() {
                             </div>
 
                             <div>
-                                <label className="block text-xs uppercase tracking-widest text-neutral-500 mb-2">예측 허용 범위 (Tolerance)</label>
+                                <label className="block text-xs uppercase tracking-widest text-neutral-500 mb-2">회원 등급 (데모)</label>
                                 <div className="flex bg-black/40 rounded-xl p-1.5 border border-neutral-800">
-                                    <div className="flex-1 py-2.5 text-sm font-medium rounded-lg text-center bg-gradient-to-r from-amber-600 to-yellow-600 text-white shadow-lg shadow-amber-900/20 cursor-default">
-                                        Standard
-                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsPremium(false)}
+                                        className={`flex-1 py-2.5 text-sm font-medium rounded-lg text-center transition ${!isPremium ? 'bg-gradient-to-r from-neutral-600 to-neutral-500 text-white shadow-lg' : 'text-neutral-500 hover:text-neutral-300'}`}
+                                    >
+                                        무료 회원
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsPremium(true)}
+                                        className={`flex-1 py-2.5 text-sm font-bold rounded-lg text-center transition flex items-center justify-center space-x-1 ${isPremium ? 'bg-gradient-to-r from-amber-600 to-yellow-600 text-white shadow-lg shadow-amber-900/20' : 'text-neutral-500 hover:text-neutral-300'}`}
+                                    >
+                                        <Crown className="w-4 h-4" />
+                                        <span>유료 회원</span>
+                                    </button>
+                                </div>
+                                <p className="text-[10px] text-neutral-500 mt-2">* 실제 로그인/결제 연동 없이 기능을 확인하기 위한 데모 스위치입니다.</p>
+                            </div>
+
+                            <div>
+                                <label className="block text-xs uppercase tracking-widest text-neutral-500 mb-2">합계 평균 허용 범위 (Sum Range)</label>
+                                <div className="grid grid-cols-4 gap-2">
+                                    {SUM_RANGE_OPTIONS.map((r) => {
+                                        const locked = !isPremium && r !== FREE_SUM_RANGE;
+                                        const active = sumRange === r;
+                                        const ratio = stats.sumRangeRatio[r];
+                                        return (
+                                            <button
+                                                key={r}
+                                                type="button"
+                                                disabled={locked}
+                                                onClick={() => setSumRange(r)}
+                                                className={`py-2.5 text-sm font-bold rounded-lg text-center transition flex flex-col items-center justify-center gap-0.5 border
+                                                    ${active ? 'bg-gradient-to-r from-amber-600 to-yellow-600 text-white border-amber-500/50 shadow-lg shadow-amber-900/20' : 'bg-black/40 text-neutral-400 border-neutral-800 hover:text-neutral-200'}
+                                                    ${locked ? 'opacity-40 cursor-not-allowed hover:text-neutral-400' : ''}
+                                                `}
+                                            >
+                                                <span className="flex items-center space-x-1">
+                                                    {locked && <Lock className="w-3 h-3" />}
+                                                    <span>{SUM_RANGE_LEVEL_LABEL[r]}</span>
+                                                </span>
+                                                <span className={`text-[10px] font-normal ${active ? 'text-white/80' : 'text-neutral-500'}`}>
+                                                    {ratio !== undefined ? `${Math.round(ratio)}%` : '-'}
+                                                </span>
+                                            </button>
+                                        );
+                                    })}
                                 </div>
                             </div>
 
@@ -520,9 +515,14 @@ export default function LottoGenius() {
                                         <input
                                             type="number"
                                             min="1"
+                                            max={maxGamesForRange}
+                                            disabled={!isPremium}
                                             value={startRange}
-                                            onChange={(e) => setStartRange(parseInt(e.target.value) || 0)}
-                                            className="w-full bg-transparent text-center px-2 py-2 text-amber-200 font-mono text-lg outline-none"
+                                            onChange={(e) => {
+                                                const v = parseInt(e.target.value) || 0;
+                                                setStartRange(Math.min(v, maxGamesForRange));
+                                            }}
+                                            className="w-full bg-transparent text-center px-2 py-2 text-amber-200 font-mono text-lg outline-none disabled:opacity-50"
                                             placeholder="시작"
                                         />
                                     </div>
@@ -531,14 +531,23 @@ export default function LottoGenius() {
                                         <input
                                             type="number"
                                             min="1"
+                                            max={maxGamesForRange}
+                                            disabled={!isPremium}
                                             value={endRange}
-                                            onChange={(e) => setEndRange(parseInt(e.target.value) || 0)}
-                                            className="w-full bg-transparent text-center px-2 py-2 text-amber-200 font-mono text-lg outline-none"
+                                            onChange={(e) => {
+                                                const v = parseInt(e.target.value) || 0;
+                                                setEndRange(Math.min(v, maxGamesForRange));
+                                            }}
+                                            className="w-full bg-transparent text-center px-2 py-2 text-amber-200 font-mono text-lg outline-none disabled:opacity-50"
                                             placeholder="종료"
                                         />
                                     </div>
                                 </div>
-                                <p className="text-[10px] text-neutral-500 mt-2">* 예: 10001번째부터 10010번째 구간의 특정한 게임을 원할 시 10001과 10010 입력</p>
+                                <p className="text-[10px] text-neutral-500 mt-2">
+                                    {isPremium
+                                        ? `* 현재 합계범위(레벨) 기준 알고리즘이 만들 수 있는 조합은 최대 ${maxGamesForRange.toLocaleString()}개입니다. 예: 10001~10010 입력 시 해당 구간의 게임을 받습니다.`
+                                        : `* 무료 회원은 ${FREE_START}~${FREE_END}번 게임만 선택할 수 있습니다.`}
+                                </p>
                             </div>
                         </div>
                     </div>
@@ -566,14 +575,14 @@ export default function LottoGenius() {
                 <div className="flex justify-center mt-12 mb-8 space-x-6">
                     <button
                         onClick={generateLottoNumbers}
-                        disabled={isGenerating || historyData.length === 0}
+                        disabled={isGenerating || historyData.length === 0 || endRange < startRange || startRange < 1}
                         className={`
               relative overflow-hidden group
               px-16 py-6 rounded-full font-black text-2xl tracking-widest
               text-neutral-900 shadow-[0_0_50px_-5px_rgba(245,158,11,0.6)]
               transition-all duration-500 transform hover:scale-105 active:scale-95
               border border-yellow-300/50
-              ${(isGenerating || historyData.length === 0) ? 'bg-neutral-800 text-neutral-500 border-neutral-700 cursor-not-allowed shadow-none' : 'bg-gradient-to-r from-yellow-300 via-amber-400 to-yellow-600 hover:from-yellow-200 hover:via-amber-300 hover:to-amber-500'}
+              ${(isGenerating || historyData.length === 0 || endRange < startRange || startRange < 1) ? 'bg-neutral-800 text-neutral-500 border-neutral-700 cursor-not-allowed shadow-none' : 'bg-gradient-to-r from-yellow-300 via-amber-400 to-yellow-600 hover:from-yellow-200 hover:via-amber-300 hover:to-amber-500'}
             `}
                     >
                         <div className="absolute inset-0 bg-white/20 transform -skew-x-12 -translate-x-full group-hover:animate-shine z-0"></div>

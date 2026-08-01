@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+import { computeLottoStats, generateLottoGames } from "../_shared/lottoAlgorithm.ts"
 
 const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
@@ -13,7 +14,7 @@ serve(async (req) => {
     }
 
     try {
-        const { startRange, endRange, tolerance = 0.05, userId } = await req.json()
+        const { startRange, endRange, sumRange = 40, userId } = await req.json()
 
         // 1. Setup Supabase Client
         const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ""
@@ -56,124 +57,19 @@ serve(async (req) => {
             doc.num1, doc.num2, doc.num3, doc.num4, doc.num5, doc.num6
         ])
 
-        // 4. Statistics Calculation (Server-Side)
-        let totalSum = 0
-        const frequency: Record<number, number> = {}
-        const lastAppearance: Record<number, number> = {}
+        // 4. Statistics + 5. Core Algorithm (공유 모듈 - src/App.tsx의 로컬 폴백과 동일한 로직)
+        const { avgSum, hotNumbers, coldNumbers } = computeLottoStats(historyData)
 
-        historyData.forEach((draw, index) => {
-            const sum = draw.reduce((a, b) => a + b, 0)
-            totalSum += sum
-            draw.forEach(num => {
-                frequency[num] = (frequency[num] || 0) + 1
-                lastAppearance[num] = index
-            })
+        const selectedGames = generateLottoGames({
+            historyData,
+            avgSum,
+            hotNums: hotNumbers.map(n => n.num),
+            coldNumbers,
+            sumRange,
+            startRange,
+            endRange,
+            prng,
         })
-
-        const avgSum = totalSum / historyData.length
-        const hotNumbers = Object.keys(frequency)
-            .map(num => ({ num: parseInt(num), count: frequency[parseInt(num)] }))
-            .sort((a, b) => b.count - a.count)
-            .slice(0, 10).map(n => n.num)
-
-        const recentHistoryLimit = historyData.length - 15
-        const coldNumbers = []
-        for (let i = 1; i <= 45; i++) {
-            if ((lastAppearance[i] ?? -1) < recentHistoryLimit) {
-                coldNumbers.push(i)
-            }
-        }
-        const lastDraw = historyData[historyData.length - 1] || []
-
-        // 5. Core Algorithm (Blackboxed)
-        const newGames = []
-        let attempts = 0
-        const targetGameCount = endRange
-        const maxAttempts = Math.max(500000, targetGameCount * 2000)
-
-        const targetMin = avgSum * (1 - tolerance)
-        const targetMax = avgSum * (1 + tolerance)
-
-        const weights: Record<number, number> = {}
-        for (let i = 1; i <= 45; i++) {
-            let weight = 10
-            if (coldNumbers.includes(i)) weight = 30
-            else if (hotNumbers.includes(i)) weight = 5
-            weights[i] = weight
-        }
-
-        while (newGames.length < targetGameCount && attempts < maxAttempts) {
-            attempts++
-
-            const numbers = new Set<number>()
-            while (numbers.size < 6) {
-                let totalWeight = 0
-                for (let i = 1; i <= 45; i++) {
-                    if (!numbers.has(i)) totalWeight += weights[i]
-                }
-
-                let randomVal = prng() * totalWeight // Using our seeded noise
-                for (let i = 1; i <= 45; i++) {
-                    if (!numbers.has(i)) {
-                        randomVal -= weights[i]
-                        if (randomVal <= 0) {
-                            numbers.add(i)
-                            break
-                        }
-                    }
-                }
-            }
-            const candidate = Array.from(numbers).sort((a, b) => a - b)
-            const sum = candidate.reduce((a, b) => a + b, 0)
-
-            if (sum < targetMin || sum > targetMax) continue
-
-            // 2-1. Consecutive (Restrict 4 or more)
-            let maxConsecutive = 1;
-            let currentConsecutive = 1;
-            for (let i = 0; i < 5; i++) {
-                if (candidate[i] + 1 === candidate[i + 1]) {
-                    currentConsecutive++;
-                } else {
-                    currentConsecutive = 1;
-                }
-                if (currentConsecutive > maxConsecutive) maxConsecutive = currentConsecutive;
-            }
-            if (maxConsecutive >= 4) continue;
-
-            // 2-2. Hot Count
-            if (candidate.filter(n => hotNumbers.includes(n)).length >= 4) continue
-            // 2-3. Birthday
-            if (candidate.every(n => n <= 31)) continue
-            // 2-4. Odd/Even
-            const odd = candidate.filter(n => n % 2 !== 0).length
-            if ([0, 1, 5, 6].includes(odd)) continue
-            // 2-5. Same End Digit
-            const ends = candidate.map(n => n % 10)
-            const dCounts: Record<number, number> = {}
-            let hasFourEnd = false
-            for (const d of ends) { dCounts[d] = (dCounts[d] || 0) + 1; if (dCounts[d] >= 4) { hasFourEnd = true; break } }
-            if (hasFourEnd) continue
-            // 2-6. Last Draw Overlap
-            if (candidate.filter(n => lastDraw.includes(n)).length >= 4) continue
-            // 2-7. Past Winner (5+ match)
-            let isPast = false
-            for (const h of historyData) {
-                let m = 0; for (let j = 0; j < 6; j++) if (candidate.includes(h[j])) m++
-                if (m >= 5) { isPast = true; break }
-            }
-            if (isPast) continue
-
-            newGames.push({
-                id: newGames.length + 1,
-                numbers: candidate,
-                sum,
-                oddCount: odd,
-                hotCount: candidate.filter(n => hotNumbers.includes(n)).length
-            })
-        }
-
-        const selectedGames = newGames.slice(startRange - 1, endRange)
 
         // 6. Return Result (Blackbox Response)
         return new Response(JSON.stringify({
