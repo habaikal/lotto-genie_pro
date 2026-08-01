@@ -82,6 +82,10 @@ cookies.txt
 # 디버그/에러 응답 덤프 등 실수로 커밋될 수 있는 임시 산출물
 out.json
 
+# Python (update_lotto.py)
+__pycache__/
+*.pyc
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache

@@ -9,7 +9,7 @@
     "build": "tsc && vite build",
     "predeploy": "npm run build",
     "deploy": "gh-pages -d dist",
-    "update-draw": "node add_draw.js",
+    "update-draw": "python update_lotto.py",
     "analyze-filters": "node scripts/analyze-filters.mjs",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview"
