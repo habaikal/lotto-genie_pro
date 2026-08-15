@@ -91,19 +91,31 @@ def run_command(command, description):
     외부 CLI 명령어를 실행하고 결과를 출력합니다.
     Windows Batch 파일 및 패키지 환경을 위해 shell=True로 실행합니다.
     """
-    print(f"\n⚡ {description} 실행 중...")
+    print(f"\n[RUN] {description} 실행 중...")
     try:
         result = subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.stdout:
             print(result.stdout.strip())
         return True
     except subprocess.CalledProcessError as e:
-        print(f"❌ {description} 실패!")
+        print(f"[FAIL] {description} 실패!")
         if e.stdout:
             print(e.stdout.strip())
         if e.stderr:
             print(e.stderr.strip(), file=sys.stderr)
         return False
+
+def get_latest_drwno_from_supabase(supabase: Client) -> int:
+    """
+    Supabase 'lotto_draws' 테이블에서 마지막으로 저장된 회차 번호를 읽어옵니다.
+    """
+    try:
+        response = supabase.table("lotto_draws").select("draw_no").order("draw_no", desc=True).limit(1).execute()
+        if response.data and len(response.data) > 0:
+            return int(response.data[0]["draw_no"])
+    except Exception as e:
+        print(f"[WARN] Supabase에서 마지막 회차 조회 실패(테이블이 비어있을 수 있음): {e}")
+    return 0
 
 def main():
     # 1. 로컬 환경 변수 로드 (.env.local 지원)
@@ -113,100 +125,113 @@ def main():
     run_command("git pull --rebase", "원격 저장소 동기화(git pull)")
 
     # 2. CSV 로컬 파일 기준으로 현재 마지막 회차 확인
-    last_drw = get_latest_drwno_from_csv()
-    next_drw = last_drw + 1
-    print(f"[INFO] 현재 CSV 마지막 회차: {last_drw}회 | 다음 시도 회차: {next_drw}회")
+    last_drw_csv = get_latest_drwno_from_csv()
+    next_drw = last_drw_csv + 1
+    print(f"[INFO] 현재 CSV 마지막 회차: {last_drw_csv}회 | 다음 신규 시도 회차: {next_drw}회")
 
-    # 3. 최신 로또 데이터 조회
+    # 3. 최신 로또 데이터 조회 및 CSV 업데이트 시도
+    csv_updated = False
     lotto_data = fetch_lotto_data(next_drw)
-    if not lotto_data:
-        print(f"[INFO] {next_drw}회차 업데이트를 진행하지 않습니다.")
-        return
+    if lotto_data:
+        # 방어적 중복 체크 (git pull 이후에도 이미 같은 회차가 들어있는지 재확인)
+        if get_latest_drwno_from_csv() < lotto_data["drwNo"]:
+            drw_no = lotto_data["drwNo"]
+            n1 = lotto_data["drwtNo1"]
+            n2 = lotto_data["drwtNo2"]
+            n3 = lotto_data["drwtNo3"]
+            n4 = lotto_data["drwtNo4"]
+            n5 = lotto_data["drwtNo5"]
+            n6 = lotto_data["drwtNo6"]
+            bonus = lotto_data["bnusNo"]
 
-    # 3-1. 방어적 중복 체크 (git pull 이후에도 이미 같은 회차가 들어있는지 재확인)
-    if get_latest_drwno_from_csv() >= lotto_data["drwNo"]:
-        print(f"[INFO] {lotto_data['drwNo']}회차는 이미 CSV에 존재합니다. 중복 추가를 건너뜁니다.")
-        return
+            # CSV 파일 최하단에 새로운 라인 추가 (날짜 컬럼 제외한 8개 열 구성)
+            try:
+                with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([drw_no, n1, n2, n3, n4, n5, n6, bonus])
+                print(f"[OK] CSV 파일 업데이트 완료: {drw_no}회차 추가")
+                csv_updated = True
+                last_drw_csv = drw_no  # CSV 마지막 회차 업데이트
+            except Exception as e:
+                print(f"[ERROR] CSV 파일 쓰기 실패: {e}")
+                return
+    else:
+        print(f"[INFO] 신규 {next_drw}회차 데이터가 동행복권 API에 아직 없습니다. CSV 업데이트를 건너뜁니다.")
 
-    # API 응답 파싱
-    drw_no = lotto_data["drwNo"]
-    date = lotto_data["drwNoDate"]
-    n1 = lotto_data["drwtNo1"]
-    n2 = lotto_data["drwtNo2"]
-    n3 = lotto_data["drwtNo3"]
-    n4 = lotto_data["drwtNo4"]
-    n5 = lotto_data["drwtNo5"]
-    n6 = lotto_data["drwtNo6"]
-    bonus = lotto_data["bnusNo"]
-
-    # 4. CSV 파일 최하단에 새로운 라인 추가 (날짜 컬럼 제외한 8개 열 구성)
-    try:
-        with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            # 회차,번호1,번호2,번호3,번호4,번호5,번호6,보너스 순서로 기록
-            writer.writerow([drw_no, n1, n2, n3, n4, n5, n6, bonus])
-        print(f"[OK] CSV 파일 업데이트 완료: {drw_no}회차 추가")
-    except Exception as e:
-        print(f"[ERROR] CSV 파일 쓰기 실패: {e}")
-        return
-
-    # 5. Supabase DB와 연동 및 동기화 (VITE_ / 기본 명명 규칙 모두 지원)
+    # 4. Supabase DB와 연동 및 동기화 (누락 회차 일괄 동기화)
     supabase_url = os.environ.get("SUPABASE_URL") or os.environ.get("VITE_SUPABASE_URL")
     supabase_key = os.environ.get("SUPABASE_KEY") or os.environ.get("VITE_SUPABASE_ANON_KEY")
 
-    db_success = False
+    db_updated = False
     if supabase_url and supabase_key:
         try:
             supabase: Client = create_client(supabase_url, supabase_key)
             
-            # 테이블명 'lotto_draws'와 컬럼명들을 실제 DB 구조에 부합하게 매핑
-            db_data = {
-                "draw_no": drw_no,
-                "date": date,
-                "num1": n1,
-                "num2": n2,
-                "num3": n3, 
-                "num4": n4,
-                "num5": n5,
-                "num6": n6, 
-                "bonus": bonus
-            }
+            # DB의 마지막 회차 번호 조회
+            last_drw_db = get_latest_drwno_from_supabase(supabase)
+            print(f"[INFO] 현재 Supabase DB 마지막 회차: {last_drw_db}회")
             
-            # 데이터 중복을 방지하기 위해 insert가 아닌 upsert를 사용합니다.
-            supabase.table("lotto_draws").upsert(db_data).execute()
-            print(f"[OK] Supabase 동기화 완료: {drw_no}회차 ({date})")
-            db_success = True
+            if last_drw_db < last_drw_csv:
+                missing_draws = list(range(last_drw_db + 1, last_drw_csv + 1))
+                print(f"[INFO] Supabase에 누락된 회차 동기화 시작: {missing_draws}")
+                
+                for drw in missing_draws:
+                    print(f"[INFO] {drw}회차 데이터를 API에서 조회 중...")
+                    drw_data = fetch_lotto_data(drw)
+                    if drw_data:
+                        db_data = {
+                            "draw_no": drw_data["drwNo"],
+                            "date": drw_data["drwNoDate"],
+                            "num1": drw_data["drwtNo1"],
+                            "num2": drw_data["drwtNo2"],
+                            "num3": drw_data["drwtNo3"], 
+                            "num4": drw_data["drwtNo4"],
+                            "num5": drw_data["drwtNo5"],
+                            "num6": drw_data["drwtNo6"], 
+                            "bonus": drw_data["bnusNo"]
+                        }
+                        supabase.table("lotto_draws").upsert(db_data).execute()
+                        print(f"[OK] Supabase 동기화 완료: {drw}회차 ({drw_data['drwNoDate']})")
+                        db_updated = True
+                    else:
+                        print(f"[WARN] {drw}회차 데이터를 가져오지 못했습니다. 동기화를 보류합니다.")
+            else:
+                print("[INFO] Supabase DB가 최신 상태입니다. 동기화할 누락 회차가 없습니다.")
         except Exception as e:
-            print(f"[ERROR] Supabase 입력 실패: {e}")
+            print(f"[ERROR] Supabase 동기화 중 오류 발생: {e}")
     else:
         print("[WARN] Supabase 환경 변수가 없어 DB 동기화를 생략합니다.")
 
-    # 6. 원스톱 Git Commit/Push 및 웹 배포 일괄 처리
-    # 데이터베이스 동기화가 성공했거나 환경변수가 생략된 경우에 실행
-    print("\n🚀 원클릭 Git Push 및 GitHub Pages 배포 자동화를 시작합니다.")
-    
-    # Git add
-    git_add_ok = run_command(f"git add {CSV_FILE}", "Git CSV 변경 사항 스테이징")
-    if not git_add_ok:
-        return
+    # 5. Git Commit/Push 및 웹 배포
+    # CSV나 DB가 업데이트된 경우에만 실행
+    if csv_updated or db_updated:
+        print("\n[DEPLOY] 변경 사항이 확인되어 원스톱 Git Push 및 GitHub Pages 배포 자동화를 시작합니다.")
         
-    # Git commit
-    git_commit_ok = run_command(f'git commit -m "Update lotto results for draw {drw_no}"', "Git 커밋 작성")
-    if not git_commit_ok:
-        print("[WARN] Git 커밋을 진행하지 않았거나 변경 사항이 없습니다.")
-        
-    # Git push
-    git_push_ok = run_command("git push", "원격 GitHub 저장소 푸시")
-    if not git_push_ok:
-        print("[WARN] Git Push 실패로 웹 배포를 보류합니다. (수동 푸시 필요)")
-        return
-        
-    # NPM 배포 (npm run deploy -> 내부적으로 npm run build 수행 후 gh-pages에 배포)
-    deploy_ok = run_command("npm run deploy", "GitHub Pages 웹 앱 빌드 및 배포")
-    if deploy_ok:
-        print(f"\n🎉 축하합니다! {drw_no}회차 당첨 정보 업데이트 및 라이브 배포가 완벽하게 처리되었습니다.")
+        # Git add
+        git_add_ok = run_command(f"git add {CSV_FILE}", "Git CSV 변경 사항 스테이징")
+        if not git_add_ok:
+            return
+            
+        # Git commit
+        commit_msg = f"Update lotto results up to draw {last_drw_csv}"
+        git_commit_ok = run_command(f'git commit -m "{commit_msg}"', "Git 커밋 작성")
+        if not git_commit_ok:
+            print("[WARN] Git 커밋을 진행하지 않았거나 변경 사항이 없습니다.")
+            
+        # Git push
+        git_push_ok = run_command("git push", "원격 GitHub 저장소 푸시")
+        if not git_push_ok:
+            print("[WARN] Git Push 실패로 웹 배포를 보류합니다. (수동 푸시 필요)")
+            return
+            
+        # NPM 배포 (npm run deploy -> 내부적으로 npm run build 수행 후 gh-pages에 배포)
+        deploy_ok = run_command("npm run deploy", "GitHub Pages 웹 앱 빌드 및 배포")
+        if deploy_ok:
+            print(f"\n[SUCCESS] 축하합니다! {last_drw_csv}회차까지의 당첨 정보 업데이트 및 라이브 배포가 완벽하게 처리되었습니다.")
+        else:
+            print("\n[FAIL] 웹 앱 배포 중 에러가 발생했습니다. 'npm run deploy'를 수동으로 실행해 보세요.")
     else:
-        print("\n❌ 웹 앱 배포 중 에러가 발생했습니다. 'npm run deploy'를 수동으로 실행해 보세요.")
+        print("\n[INFO] 로컬 CSV 및 Supabase DB 모두 변경 사항이 없어 배포 과정을 생략합니다.")
 
 if __name__ == "__main__":
     main()
