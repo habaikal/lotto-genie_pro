@@ -54,7 +54,7 @@ const TOTAL_COMBOS = 8145060;
 const f8PassRate = 1 - problemSet.size / TOTAL_COMBOS;
 
 // --- C(45,6) 전체 조합 전수 열거 ---
-const RANGES = [10, 20, 30, 40];
+const RANGES = [5, 10, 20, 30, 40];
 const counters = {
     sumRange: RANGES.map(() => 0),
     consecutive: 0,

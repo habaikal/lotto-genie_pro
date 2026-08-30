@@ -117,17 +117,18 @@ export default function LottoGenius() {
     const FREE_SUM_RANGE = 40;
     const FREE_START = 1;
     const FREE_END = 5;
-    const SUM_RANGE_OPTIONS = [10, 20, 30, 40];
-    const SUM_RANGE_LEVEL_LABEL: Record<number, string> = { 10: '레벨 1', 20: '레벨 2', 30: '레벨 3', 40: '레벨 4' };
+    const SUM_RANGE_OPTIONS = [5, 10, 20, 30, 40];
+    const SUM_RANGE_LEVEL_LABEL: Record<number, string> = { 5: '레벨 V', 10: '레벨 1', 20: '레벨 2', 30: '레벨 3', 40: '레벨 4' };
 
     // 필터 체인(4-2 연속수, 4-4 생일조합, 4-5 홀짝, 4-6 끝자리, 4-8 과거일치)을 전부 만족하는
     // 조합은 유한하다. C(45,6)=8,145,060개를 완전열거해서 합계범위별 실제 최대 개수를 구한 값
     // (scripts/analyze-filters.mjs 결과) - 회차 데이터가 크게 갱신되면 재계산해서 갱신할 것.
     const MAX_GAMES_BY_RANGE: Record<number, number> = {
-        10: 1132575,
-        20: 2108511,
-        30: 2841629,
-        40: 3330345,
+        5: 574667,
+        10: 1132327,
+        20: 2108042,
+        30: 2841012,
+        40: 3329651,
     };
 
     // 합계 평균 기준 +/- 허용 범위
@@ -479,7 +480,7 @@ export default function LottoGenius() {
 
                             <div>
                                 <label className="block text-xs uppercase tracking-widest text-neutral-500 mb-2">합계 평균 허용 범위 (Sum Range)</label>
-                                <div className="grid grid-cols-4 gap-2">
+                                <div className="grid grid-cols-5 gap-2">
                                     {SUM_RANGE_OPTIONS.map((r) => {
                                         const locked = !isPremium && r !== FREE_SUM_RANGE;
                                         const active = sumRange === r;
